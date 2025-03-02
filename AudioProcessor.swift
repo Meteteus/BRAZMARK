@@ -27,6 +27,7 @@ class AudioProcessor: ObservableObject {
     
     init() {
         loadSettings()
+        loadPresets()
     }
     
     func loadSettings() {
@@ -50,25 +51,46 @@ class AudioProcessor: ObservableObject {
             isProcessing = true
             cancellationToken.isCancelled = false
             
-            let totalWork = Double(songURLs.count * watermarkURLs.count)
+            var totalWork: Double
+            var filePairs: [(song: URL, watermark: URL)] = []
+            
+            // Create file pairs based on the processing mode
+            switch settings.processingMode {
+            case .allCombinations:
+                totalWork = Double(songURLs.count * watermarkURLs.count)
+                // Create all possible combinations
+                for songURL in songURLs {
+                    for watermarkURL in watermarkURLs {
+                        filePairs.append((song: songURL, watermark: watermarkURL))
+                    }
+                }
+                
+            case .oneToOne:
+                // Pair files in sequence, limited by the smaller array
+                let pairCount = min(songURLs.count, watermarkURLs.count)
+                totalWork = Double(pairCount)
+                
+                for i in 0..<pairCount {
+                    filePairs.append((song: songURLs[i], watermark: watermarkURLs[i]))
+                }
+            }
+            
             var completedWork: Double = 0
             
             do {
-                for songURL in songURLs {
-                    for watermarkURL in watermarkURLs {
-                        guard !cancellationToken.isCancelled else { break }
-                        
-                        await updateCurrentFiles(songURL, watermarkURL)
-                        
-                        try await processFilePair(
-                            songURL: songURL,
-                            watermarkURL: watermarkURL,
-                            outputFolder: outputFolder
-                        )
-                        
-                        completedWork += 1
-                        await updateProcessingProgress(completedWork, totalWork)
-                    }
+                for pair in filePairs {
+                    guard !cancellationToken.isCancelled else { break }
+                    
+                    await updateCurrentFiles(pair.song, pair.watermark)
+                    
+                    try await processFilePair(
+                        songURL: pair.song,
+                        watermarkURL: pair.watermark,
+                        outputFolder: outputFolder
+                    )
+                    
+                    completedWork += 1
+                    await updateProgress(completedWork, totalWork)
                 }
             } catch {
                 handleError(error)
@@ -378,8 +400,10 @@ class AudioProcessor: ObservableObject {
         currentWatermark = watermarkURL.lastPathComponent
     }
     
+    @MainActor
     private func updateProgress(_ completed: Double, _ total: Double) {
         progress = (completed / total) * 100
+        print("Progress: \(progress)%") // Debug logging
     }
     
     private func finishProcessing() {
@@ -483,6 +507,52 @@ extension AVAssetExportSession {
                     continuation.resume(throwing: CancellationError())
                 }
             }
+        }
+    }
+}
+// MARK: - Preset Management Extension
+extension AudioProcessor {
+    struct SettingsPreset: Identifiable, Codable {
+        var id = UUID()
+        var name: String
+        var settings: AppSettings
+        
+        init(name: String, settings: AppSettings) {
+            self.name = name
+            self.settings = settings
+        }
+    }
+    
+    @Published var presets: [SettingsPreset] = [] {
+        didSet { savePresets() }
+    }
+    private let presetsKey = "WatermarkPresets"
+    
+    func loadPresets() {
+        if let data = UserDefaults.standard.data(forKey: presetsKey),
+           let decoded = try? JSONDecoder().decode([SettingsPreset].self, from: data) {
+            presets = decoded
+        }
+    }
+    
+    func savePresets() {
+        if let data = try? JSONEncoder().encode(presets) {
+            UserDefaults.standard.set(data, forKey: presetsKey)
+        }
+    }
+    
+    func saveCurrentSettingsAsPreset(name: String) {
+        let preset = SettingsPreset(name: name, settings: settings)
+        presets.append(preset)
+    }
+    
+    func applyPreset(_ preset: SettingsPreset) {
+        settings = preset.settings
+    }
+    
+    func deletePreset(_ preset: SettingsPreset) {
+        if let index = presets.firstIndex(where: { $0.id == preset.id }) {
+            presets.remove(at: index)
         }
     }
 }
