@@ -99,6 +99,7 @@ struct FormatControlsView: View {
 struct FileSelectionView: View {
     let title: String
     @Binding var files: [URL]
+    @State private var isDragging = false
     
     var body: some View {
         VStack(alignment: .leading) {
@@ -123,6 +124,44 @@ struct FileSelectionView: View {
                 }
             }
             .frame(height: 80)
+            .overlay(
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(isDragging ? Color.blue : Color.clear, lineWidth: 2)
+                    
+                    if files.isEmpty && !isDragging {
+                        Text("Drag and drop \(title.lowercased()) here")
+                            .foregroundColor(.secondary)
+                    }
+                }
+            )
+            .onDrop(of: [.fileURL], isTargeted: $isDragging) { providers -> Bool
+                var succeeded = false
+                for provider in providers {
+                    provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { item, _ in
+                        guard let data = item as? Data,
+                              let path = String(data: data, encoding: .utf8),
+                              let url = URL(string: path),
+                              url.startAccessingSecurityScopedResource() else {
+                            return
+                        }
+                        
+                        // Check if the file is an audio file
+                        let fileExtension = url.pathExtension.lowercased()
+                        let validExtensions = ["mp3", "m4a", "wav", "aiff", "aac"]
+                        
+                        if validExtensions.contains(fileExtension) {
+                            DispatchQueue.main.async {
+                                self.files.append(url)
+                            }
+                            succeeded = true
+                        }
+                        
+                        url.stopAccessingSecurityScopedResource()
+                    }
+                }
+                return succeeded
+            }
         }
         .padding(.horizontal)
     }
@@ -264,5 +303,83 @@ struct AudioPreviewPlayer: NSViewRepresentable {
                 player.play()
             }
         }
+    }
+}
+
+struct PresetManagementView: View {
+    @EnvironmentObject var processor: AudioProcessor
+    @State private var newPresetName = ""
+    @State private var showingNameDialog = false
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Presets")
+                    .font(.headline)
+                
+                Spacer()
+                
+                Button("Save Current") {
+                    showingNameDialog = true
+                }
+                
+                Button("Load") {
+                    // This will be handled by the menu
+                }
+                .disabled(processor.presets.isEmpty)
+                .popover(isPresented: $showingNameDialog) {
+                    VStack(spacing: 15) {
+                        Text("Save Current Settings as Preset")
+                            .font(.headline)
+                        
+                        TextField("Preset Name", text: $newPresetName)
+                            .frame(width: 250)
+                        
+                        HStack {
+                            Button("Cancel") {
+                                newPresetName = ""
+                                showingNameDialog = false
+                            }
+                            
+                            Button("Save") {
+                                if !newPresetName.isEmpty {
+                                    processor.saveCurrentSettingsAsPreset(name: newPresetName)
+                                    newPresetName = ""
+                                    showingNameDialog = false
+                                }
+                            }
+                            .disabled(newPresetName.isEmpty)
+                        }
+                        .padding()
+                    }
+                    .padding()
+                }
+                
+                Menu {
+                    ForEach(processor.presets) { preset in
+                        Button(preset.name) {
+                            processor.applyPreset(preset)
+                        }
+                    }
+                    
+                    if !processor.presets.isEmpty {
+                        Divider()
+                        
+                        Menu("Delete...") {
+                            ForEach(processor.presets) { preset in
+                                Button(preset.name) {
+                                    processor.deletePreset(preset)
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "list.bullet")
+                        .imageScale(.large)
+                }
+                .disabled(processor.presets.isEmpty)
+            }
+        }
+        .padding(.horizontal)
     }
 }
