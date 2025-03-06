@@ -88,10 +88,6 @@ struct DatabaseFileSelectionView: View {
                 }
                 .buttonStyle(.bordered)
                 
-                if !files.isEmpty {
-                    AudioPreviewPlayer(url: files.first?.url)
-                }
-                
                 Spacer()
                 
                 // Show count indicator with clearer styling
@@ -427,6 +423,7 @@ struct FileRowView: View {
     @State private var isHovering = false
     @State private var isClickAnimating = false
     @Environment(\.colorScheme) var colorScheme
+    @ObservedObject private var playbackState = PlaybackState.shared
     
     var body: some View {
         HStack(spacing: 10) {
@@ -434,6 +431,10 @@ struct FileRowView: View {
             Image(systemName: fileType == .song ? "music.note" : "waveform")
                 .foregroundColor(fileType == .song ? .blue : .green)
                 .font(.system(size: 14))
+                .frame(width: 24)
+            
+            // Play/Stop button
+            FilePlayButton(file: file)
                 .frame(width: 24)
             
             // Filename with truncation
@@ -540,11 +541,63 @@ struct FileRowView: View {
             }
         }
         // Add ID for the row to force refresh
-        .id("file-row-\(file.id)-\(processor.refreshID)")
+        .id("file-row-\(file.id)-\(processor.refreshID)-\(playbackState.currentlyPlayingFile == file.id)")
+        // Add context menu for right-click options
+        .contextMenu {
+            Button {
+                showInFinder(file.url)
+            } label: {
+                Label("Show in Finder", systemImage: "folder")
+            }
+            
+            Divider()
+            
+            Button {
+                copyFilePath(file.url)
+            } label: {
+                Label("Copy File Path", systemImage: "doc.on.clipboard")
+            }
+            
+            Button {
+                playbackState.startPlayback(file: file)
+            } label: {
+                Label("Play File", systemImage: "play")
+            }
+            
+            Divider()
+            
+            Button(role: .destructive) {
+                confirmDeleteFile(file)
+            } label: {
+                Label("Delete File", systemImage: "trash")
+            }
+        }
+    }
+    
+    // Function to reveal the file in Finder
+    private func showInFinder(_ url: URL) {
+        NSWorkspace.shared.selectFile(url.path, inFileViewerRootedAtPath: "")
+    }
+    
+    // Function to copy the file path to clipboard
+    private func copyFilePath(_ url: URL) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(url.path, forType: .string)
+        
+        // Provide user feedback (optional)
+        let generator = NSHapticFeedbackManager.defaultPerformer
+        generator.perform(.alignment, performanceTime: .default)
     }
     
     // Determine background color based on state
     private func backgroundColorForRow() -> Color {
+        // First check if this file is currently playing
+        if PlaybackState.shared.currentlyPlayingFile == file.id {
+            // Highlight playing file with a distinct color
+            return colorScheme == .dark ? Color.blue.opacity(0.2) : Color.blue.opacity(0.1)
+        }
+        
         // If it's a watermark and a group is selected
         if fileType == .watermark,
            let selectedGroup = processor.selectedWatermarkGroup,
@@ -577,6 +630,188 @@ struct FileRowView: View {
             }
         }
     }
+}
+
+// MARK: - File Play Button Component
+struct FilePlayButton: View {
+    let file: AudioFile
+    
+    @State private var isHovering = false
+    
+    // Use the shared playback state
+    @ObservedObject private var playbackState = PlaybackState.shared
+    
+    var body: some View {
+        Button(action: {
+            togglePlayback()
+        }) {
+            Image(systemName: isPlaying ? "stop.circle" : "play.circle")
+                .font(.system(size: 15))
+                .foregroundColor(isPlaying ? .red : (isHovering ? .blue : .gray))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeOut(duration: 0.15)) {
+                isHovering = hovering
+            }
+        }
+    }
+    
+    // Computed property to determine if this file is playing
+    private var isPlaying: Bool {
+        return playbackState.currentlyPlayingFile == file.id
+    }
+    
+    private func togglePlayback() {
+        if isPlaying {
+            // Stop playback using the centralized player
+            print("FilePlayButton: Stopping playback for file \(file.id)")
+            playbackState.stopPlayback()
+        } else {
+            // Start playing this file using the centralized player
+            print("FilePlayButton: Starting playback for file \(file.id)")
+            
+            // Still send notification for compatibility with any remaining legacy code
+            if playbackState.currentlyPlayingFile != nil {
+                NotificationCenter.default.post(
+                    name: .stopAudioPlayback,
+                    object: nil
+                )
+            }
+            
+            // Use the centralized player to start playback
+            playbackState.startPlayback(file: file)
+        }
+    }
+}
+
+// Shared playback state observable object to track the currently playing file
+class PlaybackState: NSObject, ObservableObject {
+    static let shared = PlaybackState()
+    
+    @Published var currentlyPlayingFile: UUID? = nil {
+        didSet {
+            // For debugging
+            if let id = currentlyPlayingFile {
+                print("Now playing file: \(id)")
+            } else {
+                print("Stopped playback")
+            }
+        }
+    }
+    
+    // Single audio player instance shared across the app
+    private var audioPlayer: AVAudioPlayer?
+    
+    private override init() {
+        super.init()  // Don't forget this line!
+        
+        // Listen for stop notifications for compatibility with existing code
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(stopPlaybackFromNotification),
+            name: .stopAudioPlayback,
+            object: nil
+        )
+    }
+    
+    func startPlayback(file: AudioFile) {
+        // Stop any existing playback first
+        stopPlayback()
+        
+        do {
+            audioPlayer = try AVAudioPlayer(contentsOf: file.url)
+            audioPlayer?.delegate = self
+            audioPlayer?.prepareToPlay()
+            audioPlayer?.play()
+            currentlyPlayingFile = file.id
+            print("PlaybackState: Started playback for file \(file.id)")
+        } catch {
+            print("Error playing audio: \(error.localizedDescription)")
+        }
+    }
+    
+    func stopPlayback() {
+        print("PlaybackState: Stopping playback")
+        audioPlayer?.stop()
+        audioPlayer = nil
+        currentlyPlayingFile = nil
+    }
+    
+    @objc func stopPlaybackFromNotification() {
+        stopPlayback()
+    }
+    
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+}
+
+// Make PlaybackState a delegate to handle playback ended
+extension PlaybackState: AVAudioPlayerDelegate {
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            self?.currentlyPlayingFile = nil
+            print("PlaybackState: Playback finished naturally")
+        }
+    }
+}
+
+// Audio player controller that manages AVAudioPlayer
+class AudioPlayerController: NSObject, ObservableObject {
+    private var audioPlayer: AVAudioPlayer?
+    var onPlaybackEnd: (() -> Void)?
+    
+    override init() {
+        super.init()
+        // Listen for stop notifications from other players
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(stopPlaybackFromNotification),
+            name: .stopAudioPlayback,
+            object: nil
+        )
+    }
+    
+    func startPlayback(url: URL) {
+        do {
+            audioPlayer = try AVAudioPlayer(contentsOf: url)
+            audioPlayer?.delegate = self
+            audioPlayer?.prepareToPlay()
+            audioPlayer?.play()
+        } catch {
+            print("Error playing audio: \(error.localizedDescription)")
+        }
+    }
+    
+    func stopPlayback() {
+        audioPlayer?.stop()
+        audioPlayer = nil
+    }
+    
+    @objc func stopPlaybackFromNotification() {
+        stopPlayback()
+    }
+    
+    deinit {
+        stopPlayback()
+        NotificationCenter.default.removeObserver(self)
+    }
+}
+
+// Make the controller a delegate to handle playback ended
+extension AudioPlayerController: AVAudioPlayerDelegate {
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            self?.onPlaybackEnd?()
+        }
+    }
+}
+
+// Extension for notification names
+extension Notification.Name {
+    static let stopAudioPlayback = Notification.Name("StopAudioPlayback")
 }
 
 // Resize handle component
