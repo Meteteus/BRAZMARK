@@ -30,6 +30,7 @@ class AudioProcessor: ObservableObject {
     @Published var outputNamePattern: OutputNamePattern = .default
     @Published var currentTheme: AppTheme = AppTheme.loadSavedTheme()
     @Published var previewController = PreviewController()
+    @Published var refreshID = UUID() // For forcing UI updates
     
     // Preset management
     struct SettingsPreset: Identifiable, Codable {
@@ -55,11 +56,8 @@ class AudioProcessor: ObservableObject {
     private let appStateKey = "AppState"
     private var tempFilePaths: [URL] = []
     private var cancellables = Set<AnyCancellable>()
-    
-    // Processing queue for better management
-    private let processingQueue = DispatchQueue(label: "com.brazmark.processing",
-                                               qos: .userInitiated,
-                                               attributes: .concurrent)
+    private var processingQueue: AudioProcessingQueue?
+    private var audioProcessingQueue: AudioProcessingQueue?
     
     // Auto-saver for application state
     private lazy var autoSaver = AutoSaver(processor: self)
@@ -78,6 +76,16 @@ class AudioProcessor: ObservableObject {
         loadProcessingHistory()
         loadWorkflowTemplates()
         loadNamePatterns()
+        
+        // Set up notification for group membership changes
+        NotificationCenter.default.addObserver(forName: Notification.Name("RefreshWatermarkGroups"),
+                                              object: nil,
+                                              queue: .main) { [weak self] _ in
+            // Update the refreshID to trigger UI updates
+            self?.refreshID = UUID()
+            // Also trigger object change
+            self?.objectWillChange.send()
+        }
         
         // Apply the current theme
         currentTheme.apply()
@@ -146,173 +154,104 @@ class AudioProcessor: ObservableObject {
     // MARK: - Processing Control
     
     func startProcessing() {
-        guard let outputFolder = outputFolder else { return }
-        
-        // Record start time for performance tracking
-        let startTime = Date()
-        let tracker = PerformanceMonitor.shared.startMeasurement(for: "total_processing")
-        
-        // Create a dedicated task for processing
-        processingTask = Task {
-            do {
-                isProcessing = true
-                processingStartTime = Date()
-                cancellationToken.isCancelled = false
-                
-                // Pre-process all pairs to avoid doing work during the processing loop
-                let filePairs = try await prepareFilePairs()
-                let totalWork = Double(filePairs.count)
-                
-                var completedWork: Double = 0
-                var successfullyProcessed = 0
-                var errors: [String] = []
-                
-                // Process in groups if background processing is enabled
-                if settings.useBackgroundProcessing && settings.maxConcurrentProcessingTasks > 1 {
-                    // Process in batches for better performance and memory usage
-                    let batchSize = min(settings.maxConcurrentProcessingTasks, 4)
+            guard let outputFolder = outputFolder else { return }
+            
+            // Record start time for performance tracking
+            let startTime = Date()
+            let tracker = PerformanceMonitor.shared.startMeasurement(for: "total_processing")
+            
+            // Create a dedicated task for processing
+            processingTask = Task {
+                do {
+                    isProcessing = true
+                    processingStartTime = Date()
+                    cancellationToken.isCancelled = false
                     
-                    // Create semaphore to limit concurrent operations
-                    let semaphore = DispatchSemaphore(value: settings.maxConcurrentProcessingTasks)
+                    // Pre-process all pairs to avoid doing work during the processing loop
+                    let filePairs = try await prepareFilePairs()
                     
-                    for i in stride(from: 0, to: filePairs.count, by: batchSize) {
-                        guard !cancellationToken.isCancelled else { break }
-                        
-                        let end = min(i + batchSize, filePairs.count)
-                        let batch = Array(filePairs[i..<end])
-                        
-                        // Process batch with better error handling
-                        try await withThrowingTaskGroup(of: ProcessingResult.self) { group in
-                            for pair in batch {
-                                group.addTask {
-                                    // Acquire semaphore to limit concurrency
-                                    try await Task.detached {
-                                        semaphore.wait()
-                                    }.value
-                                    
-                                    defer {
-                                        // Always release semaphore when done
-                                        semaphore.signal()
-                                    }
-                                    
-                                    do {
-                                        await self.updateCurrentFiles(pair.song, pair.watermark)
-                                        
-                                        try await self.processFilePair(
-                                            songURL: pair.song,
-                                            watermarkURL: pair.watermark,
-                                            outputFolder: outputFolder
-                                        )
-                                        
-                                        return ProcessingResult.success(pair)
-                                    } catch {
-                                        return ProcessingResult.failure(pair, error)
-                                    }
-                                }
-                            }
-                            
-                            // Process results as they complete
-                            for try await result in group {
-                                switch result {
-                                case .success:
-                                    successfullyProcessed += 1
-                                case .failure(let pair, let error):
-                                    errors.append("\(pair.song.lastPathComponent) + \(pair.watermark.lastPathComponent): \(error.localizedDescription)")
-                                }
-                                
-                                // Update progress
-                                completedWork += 1
-                                await updateProgress(completedWork, totalWork)
-                            }
-                        }
-                    }
-                } else {
-                    // Sequential processing with better error handling
-                    for pair in filePairs {
-                        guard !cancellationToken.isCancelled else { break }
-                        
-                        do {
-                            await updateCurrentFiles(pair.song, pair.watermark)
-                            
-                            // Add timeout protection
-                            let result = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                                // Create a timeout task
-                                let timeoutTask = Task {
-                                    try await Task.sleep(nanoseconds: 120_000_000_000) // 2-minute timeout
-                                    continuation.resume(throwing: ProcessingError.timeout)
-                                }
-                                
-                                // Create processing task
-                                Task {
-                                    do {
-                                        try await processFilePair(
-                                            songURL: pair.song,
-                                            watermarkURL: pair.watermark,
-                                            outputFolder: outputFolder
-                                        )
-                                        timeoutTask.cancel()
-                                        continuation.resume()
-                                    } catch {
-                                        timeoutTask.cancel()
-                                        continuation.resume(throwing: error)
-                                    }
-                                }
-                            }
-                            
-                            // If we get here, processing succeeded
-                            successfullyProcessed += 1
-                        } catch {
-                            errors.append("\(pair.song.lastPathComponent) + \(pair.watermark.lastPathComponent): \(error.localizedDescription)")
-                        }
-                        
-                        completedWork += 1
-                        await updateProgress(completedWork, totalWork)
-                    }
-                }
-                
-                // Calculate processing duration
-                let duration = Date().timeIntervalSince(startTime)
-                
-                // Add to processing history
-                addToProcessingHistory(
-                    songCount: fileDatabase.songs.count,
-                    watermarkCount: fileDatabase.watermarks.count,
-                    totalFiles: successfullyProcessed,
-                    duration: duration
-                )
-                
-                // Send notification if enabled
-                if settings.showNotificationsWhenComplete {
-                    sendCompletionNotification(
-                        totalProcessed: successfullyProcessed,
-                        totalErrors: errors.count,
-                        duration: duration
+                    // Create optimized processing queue
+                    let queue = AudioProcessingQueue(
+                        settings: settings,
+                        outputFolder: outputFolder,
+                        cancellationToken: cancellationToken
                     )
-                }
-                
-                // Show results with any errors
-                await finishProcessing(success: successfullyProcessed, errors: errors)
-                
-                // Stop performance tracking
-                tracker.stop()
-            } catch {
-                await MainActor.run {
-                    isProcessing = false
-                    tracker.stop()
-                    handleError(error)
+                    
+                    // Set callbacks for UI updates
+                    await queue.setProgressUpdater { [weak self] completed, total in
+                        guard let self = self else { return }
+                        self.progress = (completed / total) * 100
+                    }
+                    
+                    await queue.setFileUpdater { [weak self] songURL, watermarkURL in
+                        guard let self = self else { return }
+                        self.currentFile = songURL.lastPathComponent
+                        self.currentWatermark = watermarkURL.lastPathComponent
+                    }
+                    
+                    await queue.setCompletionHandler { [weak self] successfullyProcessed, errors in
+                        guard let self = self else { return }
+                        
+                        // Calculate processing duration
+                        let duration = Date().timeIntervalSince(startTime)
+                        
+                        // Add to processing history
+                        self.addToProcessingHistory(
+                            songCount: self.fileDatabase.songs.count,
+                            watermarkCount: self.fileDatabase.watermarks.count,
+                            totalFiles: successfullyProcessed,
+                            duration: duration
+                        )
+                        
+                        // Send notification if enabled
+                        if self.settings.showNotificationsWhenComplete {
+                            self.sendCompletionNotification(
+                                totalProcessed: successfullyProcessed,
+                                totalErrors: errors.count,
+                                duration: duration
+                            )
+                        }
+                        
+                        // Show results with any errors
+                        self.finishProcessing(success: successfullyProcessed, errors: errors)
+                        
+                        // Stop performance tracking
+                        tracker.stop()
+                    }
+                    
+                    // Store for potential cancellation
+                    self.audioProcessingQueue = queue
+                    
+                    // Queue the file pairs and start processing
+                    await queue.queueFilePairs(filePairs)
+                    await queue.startProcessing()
+                    
+                } catch {
+                    await MainActor.run {
+                        isProcessing = false
+                        tracker.stop()
+                        handleError(error)
+                    }
                 }
             }
         }
-    }
-    
-    func cancelProcessing() {
-        processingStartTime = nil
-        cancellationToken.isCancelled = true
-        processingTask?.cancel()
-        isProcessing = false
-        resetCurrentFiles()
-        cleanupTempFiles() // Clean up any temporary files
-    }
+        
+        func cancelProcessing() {
+            processingStartTime = nil
+            cancellationToken.isCancelled = true
+            
+            // Cancel processing queue operations
+            if let audioProcessingQueue = audioProcessingQueue {
+                Task {
+                    await audioProcessingQueue.cancelProcessing()
+                }
+            }
+            
+            processingTask?.cancel()
+            isProcessing = false
+            resetCurrentFiles()
+            cleanupTempFiles() // Clean up any temporary files
+        }
     
     // MARK: - Core Processing
     
@@ -1000,6 +939,19 @@ class AudioProcessor: ObservableObject {
     }
     
     private func finishProcessing(success: Int, errors: [String]) {
+        // Calculate processing duration if we have a start time
+        let duration: TimeInterval
+        if let startTime = processingStartTime {
+            duration = Date().timeIntervalSince(startTime)
+        } else {
+            duration = 0
+        }
+        
+        // Format duration into minutes and seconds
+        let minutes = Int(duration) / 60
+        let seconds = Int(duration) % 60
+        let timeString = "\(minutes) minute\(minutes == 1 ? "" : "s") and \(seconds) second\(seconds == 1 ? "" : "s")"
+        
         processingStartTime = nil
         isProcessing = false
         resetCurrentFiles()
@@ -1009,14 +961,14 @@ class AudioProcessor: ObservableObject {
         
         if errors.isEmpty {
             alert.messageText = "Processing Complete"
-            alert.informativeText = "All \(success) files have been processed successfully."
+            alert.informativeText = "All \(success) files have been processed successfully.\nIt took \(timeString)."
         } else {
             alert.messageText = "Processing Complete with Errors"
             
             if success > 0 {
-                alert.informativeText = "Successfully processed \(success) files. \(errors.count) files had errors."
+                alert.informativeText = "Successfully processed \(success) files. \(errors.count) files had errors.\nIt took \(timeString)."
             } else {
-                alert.informativeText = "No files were processed successfully. \(errors.count) files had errors."
+                alert.informativeText = "No files were processed successfully. \(errors.count) files had errors.\nIt took \(timeString)."
             }
             
             // Add details button for errors

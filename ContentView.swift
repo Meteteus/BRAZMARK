@@ -235,8 +235,9 @@ struct FilesTabView: View {
             WatermarkGroupView()
                 .environmentObject(processor)
             
-            // File Selection
-            HStack(alignment: .top, spacing: 12) {
+            // File Selection - Side-by-side layout with improved design
+            HStack(alignment: .top, spacing: 15) {
+                // Songs and Watermarks side by side
                 DatabaseFileSelectionView(title: "Songs", fileType: .song)
                     .environmentObject(processor)
                     .frame(maxWidth: .infinity)
@@ -859,16 +860,36 @@ struct FormatControlsView: View {
             }
             
             HStack {
-                Text("Watermark Volume:")
-                Slider(value: $processor.settings.watermarkVolume, in: 0.01...1.0, step: 0.01)
-                Text("\(Int(processor.settings.watermarkVolume * 100))%")
-                
-                // Keep watermark settings synced
-                Spacer()
-                    .onChange(of: processor.settings.watermarkVolume) { _ in
-                        processor.settings.watermarkSettings.watermarkVolume = processor.settings.watermarkVolume
-                    }
-            }
+                            // Modern volume icon that visually indicates level
+                            Image(systemName: processor.settings.watermarkVolume < 0.33 ? "speaker.wave.1.fill" :
+                                             processor.settings.watermarkVolume < 0.66 ? "speaker.wave.2.fill" : "speaker.wave.3.fill")
+                                .foregroundColor(processor.currentTheme.accentColor)
+                                .imageScale(.medium)
+                                .frame(width: 24)
+                            
+                            Text("Watermark Volume:")
+                                .foregroundColor(processor.currentTheme.textColor)
+                            
+                            // Smooth slider with simultaneous value updates
+                            Slider(
+                                value: Binding<Float>(
+                                    get: { processor.settings.watermarkVolume },
+                                    set: { newValue in
+                                        // Update both values simultaneously to reduce update cycles
+                                        processor.settings.watermarkVolume = newValue
+                                        processor.settings.watermarkSettings.watermarkVolume = newValue
+                                    }
+                                ),
+                                in: 0.01...1.0
+                            )
+                            .accentColor(processor.currentTheme.accentColor)
+                            
+                            // Stabilized percentage display
+                            Text("\(Int(processor.settings.watermarkVolume * 100))%")
+                                .foregroundColor(processor.currentTheme.textColor)
+                                .monospacedDigit()
+                                .frame(width: 45, alignment: .trailing)
+                        }
         }
     }
 }

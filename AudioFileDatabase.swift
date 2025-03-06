@@ -1,7 +1,7 @@
 import Foundation
 import AVFoundation
 
-/// Manages a database of audio files stored in the app's internal storage
+/// Manages a database of audio files stored in the app's internal storage with optimized performance
 class AudioFileDatabase: ObservableObject {
     // Published collections for UI binding
     @Published var songs: [AudioFile] = []
@@ -17,6 +17,21 @@ class AudioFileDatabase: ObservableObject {
     private let watermarkGroupsKey = "WatermarkGroups"
     private let songsMetadataKey = "SongsMetadata"
     private let watermarksMetadataKey = "WatermarksMetadata"
+    
+    // Caching and performance optimizations
+    private var fileInfoCache: [URL: AudioFileInfo] = [:]
+    private var watermarkGroupCache: [UUID: Set<UUID>] = [:]
+    private let fileOperationQueue = DispatchQueue(label: "com.brazmark.fileOperations", qos: .userInitiated, attributes: .concurrent)
+    private let metadataQueue = DispatchQueue(label: "com.brazmark.metadata", qos: .userInitiated)
+    
+    // Struct to store cached file info
+    private struct AudioFileInfo {
+        let duration: Double
+        let channels: Int
+        let sampleRate: Double
+        let fileSize: Int64
+        let dateCreated: Date
+    }
     
     init() {
         // Get the app's container directory
@@ -100,7 +115,7 @@ class AudioFileDatabase: ObservableObject {
         }
     }
     
-    /// Add a watermark to a group
+    /// Add a watermark to a group with optimized UI updates
     @MainActor
     func addWatermarkToGroup(_ watermark: AudioFile, group: WatermarkGroup) {
         guard watermark.type == .watermark else { return }
@@ -108,53 +123,59 @@ class AudioFileDatabase: ObservableObject {
         if let index = watermarkGroups.firstIndex(where: { $0.id == group.id }) {
             // Only add if not already in the group
             if !watermarkGroups[index].watermarkIds.contains(watermark.id) {
-                // Create a new array to trigger UI updates
-                var updatedIds = watermarkGroups[index].watermarkIds
-                updatedIds.append(watermark.id)
-                
-                // Force a UI update by replacing the entire group object
-                let updatedGroup = WatermarkGroup(
-                    id: group.id,
-                    name: group.name,
-                    watermarkIds: updatedIds
-                )
-                
+                // Create a new array and update in a single operation to minimize redraws
+                var updatedGroup = watermarkGroups[index]
+                updatedGroup.watermarkIds.append(watermark.id)
                 watermarkGroups[index] = updatedGroup
+                
+                // Save changes
                 saveDatabase()
                 
-                // Debug info
-                print("Added watermark \(watermark.originalName) to group \(group.name)")
-                print("Group now has \(watermarkGroups[index].watermarkIds.count) watermarks")
+                // Post notification with specific info to minimize unnecessary updates
+                NotificationCenter.default.post(
+                    name: Notification.Name("RefreshWatermarkGroups"),
+                    object: nil,
+                    userInfo: [
+                        "watermarkID": watermark.id,
+                        "groupID": group.id,
+                        "action": "add"
+                    ]
+                )
                 
-                // Force an UI refresh
+                // Force UI refresh
                 objectWillChange.send()
             }
         }
     }
-    
-    /// Remove a watermark from a group
+
+    /// Remove a watermark from a group with optimized UI updates
     @MainActor
     func removeWatermarkFromGroup(_ watermark: AudioFile, group: WatermarkGroup) {
         if let index = watermarkGroups.firstIndex(where: { $0.id == group.id }) {
-            // Create a new array without the item to force UI update
-            let updatedIds = watermarkGroups[index].watermarkIds.filter { $0 != watermark.id }
-            
-            // Replace the entire group object
-            let updatedGroup = WatermarkGroup(
-                id: group.id,
-                name: group.name,
-                watermarkIds: updatedIds
-            )
-            
-            watermarkGroups[index] = updatedGroup
-            saveDatabase()
-            
-            // Debug info
-            print("Removed watermark \(watermark.originalName) from group \(group.name)")
-            print("Group now has \(watermarkGroups[index].watermarkIds.count) watermarks")
-            
-            // Force an UI refresh
-            objectWillChange.send()
+            // Only remove if it exists
+            if watermarkGroups[index].watermarkIds.contains(watermark.id) {
+                // Create a new array and update in a single operation
+                var updatedGroup = watermarkGroups[index]
+                updatedGroup.watermarkIds.removeAll { $0 == watermark.id }
+                watermarkGroups[index] = updatedGroup
+                
+                // Save changes
+                saveDatabase()
+                
+                // Post notification with specific info
+                NotificationCenter.default.post(
+                    name: Notification.Name("RefreshWatermarkGroups"),
+                    object: nil,
+                    userInfo: [
+                        "watermarkID": watermark.id,
+                        "groupID": group.id,
+                        "action": "remove"
+                    ]
+                )
+                
+                // Force UI refresh
+                objectWillChange.send()
+            }
         }
     }
     

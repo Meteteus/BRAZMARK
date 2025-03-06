@@ -6,8 +6,8 @@
 import Foundation
 import AVFoundation
 
-/// Handles conversion of audio files to compatible formats
-class FormatConverter {
+/// Handles conversion of audio files to compatible formats with performance optimizations
+actor FormatConverter {
     /// Supported input formats
     static let supportedInputFormats = [
         "mp3", "wav", "m4a", "aiff", "aac", "flac", "ogg", "wma", "aif"
@@ -18,32 +18,65 @@ class FormatConverter {
         "mp3", "wav", "m4a", "aiff", "aac"
     ]
     
-    // Add a file extension cache to avoid redundant checks
+    // Improved caching mechanisms
     private static var formatCache: [URL: Bool] = [:]
-    private static let cacheQueue = DispatchQueue(label: "com.brazmark.formatCacheQueue")
+    private static var conversionCache: [URL: URL] = [:] // Cache to avoid duplicate conversions
+    private static let cache = Cache<NSURL, NSData>() // In-memory cache for file data
     
-    // Clear cache method
-    static func clearFormatCache() {
-        cacheQueue.async {
+    // Cache max settings
+    private static let maxCacheItems = 20
+    private static let maxCacheSize = 500 * 1024 * 1024 // 500MB
+    
+    // Logging
+    private static let consoleLogger = { (message: String) in
+        print("[FormatConverter] \(message)")
+    }
+    
+    // Clear cache method with improved memory management
+    static func clearCache() async {
+        Task {
             formatCache.removeAll()
+            conversionCache.removeAll()
+            cache.removeAllObjects()
+            
+            // Clean up any temporary conversion files that are no longer needed
+            let tempDir = FileManager.default.temporaryDirectory
+            let fileManager = FileManager.default
+            
+            do {
+                let tempFiles = try fileManager.contentsOfDirectory(at: tempDir, includingPropertiesForKeys: nil)
+                for file in tempFiles where file.lastPathComponent.hasPrefix("bm_conv_") {
+                    try? fileManager.removeItem(at: file)
+                }
+            } catch {
+                consoleLogger("Failed to clean conversion cache: \(error.localizedDescription)")
+            }
         }
     }
     
-    // Optimized needsConversion method with caching
+    // Improved conversion check with thread safety
     static func needsConversion(url: URL) -> Bool {
-        return cacheQueue.sync {
-            if let cachedResult = formatCache[url] {
-                return cachedResult
-            }
-            
-            let fileExtension = url.pathExtension.lowercased()
-            let result = supportedInputFormats.contains(fileExtension) &&
-                       !directlyUsableFormats.contains(fileExtension)
-            
-            // Cache the result
-            formatCache[url] = result
-            return result
+        // Fast path: check extension
+        let fileExtension = url.pathExtension.lowercased()
+        
+        if !supportedInputFormats.contains(fileExtension) {
+            // Unsupported format
+            return false
         }
+        
+        if directlyUsableFormats.contains(fileExtension) {
+            // Directly usable
+            return false
+        }
+        
+        // Check cache
+        if let cachedResult = formatCache[url] {
+            return cachedResult
+        }
+        
+        // If we got here, it needs conversion
+        formatCache[url] = true
+        return true
     }
     
     // Optimized convertFile method
